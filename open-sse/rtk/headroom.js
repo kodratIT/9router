@@ -26,6 +26,8 @@ function messagePayload(body) {
   if (Array.isArray(body?.input)) return body.input;
   const kiro = collectKiroHeadroomMessages(body);
   if (kiro) return kiro.messages;
+  const commandCode = collectCommandCodeHeadroomMessages(body);
+  if (commandCode) return commandCode.messages;
   return null;
 }
 
@@ -212,6 +214,114 @@ function applyKiroHeadroomMessages(projection, compressedMessages, diagnostics) 
   return true;
 }
 
+// CommandCode keeps the conversation in params.messages[] with Anthropic-style
+// blocks: tool output at `tool-result.output.value`, prose at `text.text`
+// (see translator/request/openai-to-commandcode.js). /v1/compress only understands
+// OpenAI shape — it leaves `{type:"tool-result", output}` untouched — so every
+// compressible string is projected to an OpenAI message and written back through
+// its recorded `target`.
+function collectCommandCodeHeadroomMessages(body) {
+  const params = body?.params;
+  if (!params || typeof params !== "object") return null;
+  if (!Array.isArray(params.messages)) return null;
+
+  const messages = [];
+  const targets = [];
+
+  const addTextTarget = (role, text, target, extra = {}) => {
+    if (typeof text !== "string") return;
+    messages.push({ role, content: text, ...extra });
+    targets.push(target);
+  };
+
+  const toToolCalls = (blocks) => {
+    const calls = [];
+    for (const block of blocks) {
+      if (block?.type !== "tool-call") continue;
+      calls.push({
+        id: block.toolCallId,
+        type: "function",
+        function: {
+          name: block.toolName || "",
+          arguments: JSON.stringify(block.input ?? {}),
+        },
+      });
+    }
+    const valid = calls.filter((call) => call.id || call.function.name);
+    return valid.length > 0 ? valid : undefined;
+  };
+
+  for (const msg of params.messages) {
+    const blocks = msg?.content;
+    if (!Array.isArray(blocks)) continue;
+
+    if (msg.role === "tool") {
+      for (const block of blocks) {
+        if (block?.type !== "tool-result") continue;
+        const output = block.output;
+        if (!output || typeof output !== "object") continue;
+        addTextTarget(
+          "tool",
+          output.value,
+          { object: output, key: "value" },
+          block.toolCallId ? { tool_call_id: block.toolCallId } : {}
+        );
+      }
+      continue;
+    }
+
+    if (msg.role === "assistant") {
+      const toolCalls = toToolCalls(blocks);
+      for (const block of blocks) {
+        if (block?.type !== "text") continue;
+        addTextTarget(
+          "assistant",
+          block.text,
+          { object: block, key: "text" },
+          toolCalls ? { tool_calls: toolCalls } : {}
+        );
+      }
+      continue;
+    }
+
+    for (const block of blocks) {
+      if (block?.type !== "text") continue;
+      addTextTarget("user", block.text, { object: block, key: "text" });
+    }
+  }
+
+  return messages.length > 0 ? { messages, targets } : null;
+}
+
+function applyCommandCodeHeadroomMessages(projection, compressedMessages, diagnostics) {
+  if (!Array.isArray(compressedMessages) || compressedMessages.length !== projection.messages.length) {
+    setDiagnostic(diagnostics, "proxy response did not match CommandCode message count");
+    return false;
+  }
+
+  const updates = [];
+  for (let i = 0; i < projection.messages.length; i++) {
+    const expected = projection.messages[i];
+    const actual = compressedMessages[i];
+    if (!actual || actual.role !== expected.role) {
+      setDiagnostic(diagnostics, "proxy response did not preserve CommandCode message order");
+      return false;
+    }
+
+    const text = textFromHeadroomMessage(actual);
+    if (text === null) {
+      setDiagnostic(diagnostics, "proxy response missing CommandCode text content");
+      return false;
+    }
+    updates.push({ target: projection.targets[i], text });
+  }
+
+  for (const update of updates) {
+    update.target.object[update.target.key] = update.text;
+  }
+  return true;
+}
+
 // POST messages to Headroom /v1/compress; returns compressed messages + stats or null.
 async function callCompress(url, messages, model, timeoutMs, compressUserMessages, diagnostics) {
   const endpoint = buildCompressEndpoint(url);
@@ -318,6 +428,21 @@ export async function compressWithHeadroom(body, { enabled, url, model, format, 
       const data = await callCompress(url, projection.messages, model, timeoutMs, compressUserMessages, diagnostics || {});
       if (!data) return null;
       if (!applyKiroHeadroomMessages(projection, data.messages, diagnostics)) return null;
+      if (diagnostics) diagnostics.after = captureSizeSnapshot(body);
+      return data;
+    }
+
+    // CommandCode shape: params.messages[] blocks are projected to OpenAI messages
+    // (tool output -> role "tool"), compressed, then copied back into their blocks.
+    if (format === "commandcode") {
+      const projection = collectCommandCodeHeadroomMessages(body);
+      if (!projection) {
+        setDiagnostic(diagnostics, "CommandCode request did not project to messages[]");
+        return null;
+      }
+      const data = await callCompress(url, projection.messages, model, timeoutMs, compressUserMessages, diagnostics || {});
+      if (!data) return null;
+      if (!applyCommandCodeHeadroomMessages(projection, data.messages, diagnostics)) return null;
       if (diagnostics) diagnostics.after = captureSizeSnapshot(body);
       return data;
     }

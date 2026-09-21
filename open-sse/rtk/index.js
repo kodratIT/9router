@@ -14,6 +14,11 @@ export function compressMessages(body, enabled) {
     return compressKiroFormat(body, enabled);
   }
 
+  // CommandCode format: params.messages[] with tool-result blocks
+  if (Array.isArray(body.params?.messages)) {
+    return compressCommandCodeFormat(body, enabled);
+  }
+
   // Support both OpenAI/Claude "messages" and OpenAI Responses "input"
   const items = Array.isArray(body.messages) ? body.messages
     : Array.isArray(body.input) ? body.input
@@ -112,6 +117,32 @@ function compressKiroFormat(body, enabled) {
     }
   } catch (e) {
     console.warn("[RTK] compressKiroFormat error:", e.message);
+    return null;
+  }
+  return stats;
+}
+
+// Compress CommandCode format: params.messages[].content[] blocks. The translator
+// nests tool output at `output.value` (see translator/request/openai-to-commandcode.js),
+// so the string never reaches the OpenAI/Claude shapes handled above.
+function compressCommandCodeFormat(body, enabled) {
+  const stats = { bytesBefore: 0, bytesAfter: 0, hits: [] };
+  try {
+    for (const msg of body.params.messages) {
+      const blocks = msg?.content;
+      if (!Array.isArray(blocks)) continue;
+
+      for (const block of blocks) {
+        if (block?.type !== "tool-result") continue;
+        const output = block.output;
+        if (!output || typeof output !== "object") continue;
+        if (typeof output.value === "string") {
+          output.value = compressText(output.value, stats, "commandcode-tool-result");
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[RTK] compressCommandCodeFormat error:", e.message);
     return null;
   }
   return stats;

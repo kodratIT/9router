@@ -19,6 +19,13 @@ export function injectSystemPrompt(body, format, prompt) {
       return;
     }
 
+    // CommandCode owns params.system (string) and keeps its turn blocks in
+    // params.messages[] — no top-level messages[] to sniff below.
+    if (format === FORMATS.COMMANDCODE || Array.isArray(body.params?.messages)) {
+      injectCommandCodeSystem(body, prompt);
+      return;
+    }
+
     // Claude/Gemini own a dedicated system field, yet their bodies also carry
     // messages[]/contents[] — decide by format label before the shape sniff below.
     // Anthropic rejects a "system" role inside messages[] (no such input role).
@@ -257,6 +264,21 @@ function injectGeminiSystem(body, prompt) {
       return;
     }
     try { target[key] = { parts: [{ text: prompt }] }; } catch (_) {}
+  } catch (_) {}
+}
+
+// ---- CommandCode ----
+// The CommandCode translator folds every system message into params.system and
+// forbids a "system" role inside params.messages, so the prompt is appended to
+// that string. Absent/empty becomes the prompt verbatim.
+function injectCommandCodeSystem(body, prompt) {
+  try {
+    const params = body?.params;
+    if (!params || typeof params !== "object") return;
+    const curr = typeof params.system === "string" ? params.system : "";
+    const next = dedupStringAppend(curr, prompt);
+    if (next === curr) return; // already injected — idempotent across retries
+    try { params.system = next; } catch (_) { /* frozen/proxy fail-open */ }
   } catch (_) {}
 }
 
